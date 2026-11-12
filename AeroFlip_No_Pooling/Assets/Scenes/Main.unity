@@ -5239,7 +5239,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1570885297
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -5261,6 +5261,8 @@ MonoBehaviour:
   maxRecorders: 128
   maxMetricBufferMiB: 64
   enableEditorDiagnostics: 0
+  saveUnityProfilerRawCapture: 1
+  rawProfilerBufferMiB: 128
   capacityFramesPerSecond: 1000
   settleAfterAllocationSeconds: 1
   frameTimingSampleEveryNFrames: 8

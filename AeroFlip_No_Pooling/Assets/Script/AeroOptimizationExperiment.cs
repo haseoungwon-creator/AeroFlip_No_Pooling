@@ -16,8 +16,8 @@ using UnityEditor.Profiling;
 using UnityEditorInternal;
 #endif
 
-// ����ȭ ON/OFF�� �������� �ʰ�, Unity�� �����ϴ� Profiler ��ġ�� CSV�� �����մϴ�.
-// ���� enum, Reflection, RAW ����, Batch ���� ����� �����ϴ�.
+// 최적화 ON/OFF에 관여하지 않고 Unity Profiler 수치를 CSV로 기록합니다.
+// 필요할 때만 Unity Profiler 원본 .raw 캡처를 추가로 저장할 수 있습니다.
 [DisallowMultipleComponent]
 public sealed class AeroOptimizationExperiment : MonoBehaviour
 {
@@ -44,6 +44,13 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
     [Header("Capture overhead controls")]
     [Tooltip("Enable only for a separate call-tree investigation. Baseline capture does not turn on the global Profiler.")]
     [SerializeField] private bool enableEditorDiagnostics;
+
+    [Header("Unity Profiler 원본 캡처 (선택 사항)")]
+    [Tooltip("ON: CSV 외에 Unity Profiler에서 다시 열 수 있는 .raw 파일을 저장합니다. 전체 Profiler 수집으로 성능 오버헤드가 증가하므로 최적화 전후 수치 비교용 기본 측정에서는 OFF를 권장합니다.")]
+    [SerializeField] private bool saveUnityProfilerRawCapture = false;
+    [Tooltip("원본 프로파일링을 위한 최대 버퍼(MiB). 메모리 사용량이 늘어날 수 있으므로 필요한 경우에만 조절하세요.")]
+    [SerializeField, Range(32, 512)] private int rawProfilerBufferMiB = 128;
+
     [Tooltip("Preallocate for this FPS. The capture reports truncation if this capacity is exceeded.")]
     [SerializeField, Range(60, 2000)] private int capacityFramesPerSecond = 1000;
     [SerializeField, Min(0.1f)] private float settleAfterAllocationSeconds = 1f;
@@ -141,6 +148,16 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
     private bool finished;
     private bool profilerStateSaved;
     private bool previousProfilerEnabled;
+
+    // .raw 캡처 시 Unity 전역 Profiler 설정을 잠시 변경하고 종료 후 복원합니다.
+    private bool rawProfilerStateSaved;
+    private bool rawProfilerActive;
+    private bool rawPreviousEnabled;
+    private bool rawPreviousBinaryLog;
+    private string rawPreviousLogFile;
+    private int rawPreviousMaxUsedMemory;
+    private string rawProfilerOutputFile = "";
+    private string rawProfilerStatus = "disabled";
 #if UNITY_EDITOR
     private bool previousEditorProfilerDriverEnabled;
 #endif
@@ -212,6 +229,8 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
             recordStart = Time.realtimeSinceStartup;
             recording = true;
             pendingFixedUpdates = 0;
+            if (saveUnityProfilerRawCapture)
+                StartUnityProfilerRawCapture();
 #if UNITY_EDITOR
             if (enableEditorDiagnostics)
                 StartEditorSpikeObserver();
@@ -330,6 +349,7 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
         {
             warmingUp = false;
             preparingCapture = false;
+            StopUnityProfilerRawCapture();
             DisposeRecorders();
             ReleaseCaptureBuffers();
             RestoreProfilerState();
@@ -389,6 +409,8 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
                 Mathf.CeilToInt(captureSeconds * capacityFramesPerSecond) + 32,
                 256, 120000);
             rejectedMetricValues = 0;
+            rawProfilerStatus = saveUnityProfilerRawCapture ? "waiting_for_capture_start" : "disabled";
+            rawProfilerOutputFile = "";
 
             outputDirectory = BuildOutputDirectory(saveSubfolder);
             Directory.CreateDirectory(outputDirectory);
@@ -450,6 +472,7 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
             recording = false;
             preparingCapture = false;
             finished = true;
+            StopUnityProfilerRawCapture();
             DisposeRecorders();
             ReleaseCaptureBuffers();
             RestoreProfilerState();
@@ -606,6 +629,8 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
         recording = false;
         finished = true;
         finishReason = reason;
+        // 원본 Profiler 기록은 CSV 작성/씬 조사가 시작되기 전에 종료합니다.
+        StopUnityProfilerRawCapture();
         // ������ ���� �� ������Ʈ ���� ���縦 �����մϴ�. ���� �����ӿ� ���Ե��� �ʽ��ϴ�.
         try { finalCensus = TakeSceneCensus("after_capture_finished"); }
         catch (Exception e) { Debug.LogWarning("[AeroProfiler] Scene Census ����: " + e.Message, this); }
@@ -1027,6 +1052,10 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
             WriteMetadata(writer, "record_every_available_metric", recordEveryAvailableMetric.ToString().ToLowerInvariant());
             WriteMetadata(writer, "capture_format_version", "2_baseline_core_counters");
             WriteMetadata(writer, "editor_diagnostics_enabled", enableEditorDiagnostics.ToString().ToLowerInvariant());
+            WriteMetadata(writer, "unity_profiler_raw_requested", saveUnityProfilerRawCapture.ToString().ToLowerInvariant());
+            WriteMetadata(writer, "unity_profiler_raw_status", rawProfilerStatus);
+            WriteMetadata(writer, "unity_profiler_raw_path", rawProfilerOutputFile);
+            WriteMetadata(writer, "unity_profiler_raw_note", "Raw capture enables global Profiler and changes measurement overhead; do not compare its CSV directly to baseline-only CSV.");
             WriteMetadata(writer, "global_profiler_was_enabled", previousProfilerEnabled.ToString().ToLowerInvariant());
             WriteMetadata(writer, "frame_capacity", frameCapacity.ToString(Invariant));
             WriteMetadata(writer, "metric_array_bytes", ((long)frameCapacity * metrics.Count * sizeof(double)).ToString(Invariant));
@@ -1223,6 +1252,106 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
             metrics.Clear();
     }
 
+    // 선택적인 Unity 원본 Profiler 캡처입니다. Player에서는 Development Build가 필요합니다.
+    // .raw는 Profiler 창에서 Load하여 CPU Timeline / Hierarchy를 다시 볼 수 있습니다.
+    private void StartUnityProfilerRawCapture()
+    {
+        rawProfilerOutputFile = Path.Combine(outputDirectory, outputPrefix + "_unity_profiler.raw");
+
+        if (!Application.isEditor && !Debug.isDebugBuild)
+        {
+            rawProfilerStatus = "skipped_requires_development_build";
+            Debug.LogWarning("[AeroProfiler] .raw 캡처는 Player의 Development Build에서 실행하세요.", this);
+            return;
+        }
+
+        // 다른 도구가 원본 기록을 저장하고 있으면 해당 파일을 덮어쓰지 않습니다.
+        if (Profiler.enableBinaryLog)
+        {
+            rawProfilerStatus = "skipped_existing_binary_capture";
+            Debug.LogWarning("[AeroProfiler] 이미 Unity Profiler binary log가 기록 중이므로 .raw 캡처를 건너뜁니다.", this);
+            return;
+        }
+
+        try
+        {
+            rawPreviousEnabled = Profiler.enabled;
+            rawPreviousBinaryLog = Profiler.enableBinaryLog;
+            rawPreviousLogFile = Profiler.logFile;
+            rawPreviousMaxUsedMemory = Profiler.maxUsedMemory;
+            rawProfilerStateSaved = true;
+
+            int requestedBytes = rawProfilerBufferMiB * 1024 * 1024;
+            if (Profiler.maxUsedMemory < requestedBytes)
+                Profiler.maxUsedMemory = requestedBytes;
+
+            Profiler.logFile = rawProfilerOutputFile;
+            Profiler.enableBinaryLog = true;
+            Profiler.enabled = true;
+            rawProfilerActive = true;
+            rawProfilerStatus = "recording";
+        }
+        catch (Exception ex)
+        {
+            rawProfilerStatus = "start_error_" + ex.GetType().Name;
+            rawProfilerActive = false;
+            RestoreUnityProfilerRawState();
+            Debug.LogWarning("[AeroProfiler] Unity 원본 Profiler 캡처 시작 실패: " + ex.Message, this);
+        }
+    }
+
+    private void StopUnityProfilerRawCapture()
+    {
+        if (!rawProfilerStateSaved)
+            return;
+
+        try
+        {
+            if (rawProfilerActive)
+            {
+                // Unity 문서에 따라 logFile을 비워서 .raw 파일을 닫습니다.
+                Profiler.enabled = false;
+                Profiler.logFile = "";
+                Profiler.enableBinaryLog = false;
+                rawProfilerStatus = File.Exists(rawProfilerOutputFile)
+                    ? "saved" : "stopped_file_not_found";
+            }
+        }
+        catch (Exception ex)
+        {
+            rawProfilerStatus = "stop_error_" + ex.GetType().Name;
+            Debug.LogWarning("[AeroProfiler] Unity 원본 Profiler 캡처 종료 실패: " + ex.Message, this);
+        }
+        finally
+        {
+            rawProfilerActive = false;
+            RestoreUnityProfilerRawState();
+        }
+    }
+
+    private void RestoreUnityProfilerRawState()
+    {
+        if (!rawProfilerStateSaved)
+            return;
+
+        try
+        {
+            Profiler.enabled = false;
+            Profiler.logFile = rawPreviousLogFile ?? "";
+            Profiler.enableBinaryLog = rawPreviousBinaryLog;
+            Profiler.maxUsedMemory = rawPreviousMaxUsedMemory;
+            Profiler.enabled = rawPreviousEnabled;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("[AeroProfiler] Unity Profiler 전역 설정 복원 실패: " + ex.Message, this);
+        }
+        finally
+        {
+            rawProfilerStateSaved = false;
+        }
+    }
+
     private void RestoreProfilerState()
     {
         if (!profilerStateSaved) return;
@@ -1267,6 +1396,7 @@ public sealed class AeroOptimizationExperiment : MonoBehaviour
         {
             warmingUp = false;
             preparingCapture = false;
+            StopUnityProfilerRawCapture();
             DisposeRecorders();
             ReleaseCaptureBuffers();
             RestoreProfilerState();
